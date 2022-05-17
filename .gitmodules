@@ -1,0 +1,6 @@
+[submodule "partitioning/PyTorch-LBFGS"]
+	path = partitioning/PyTorch-LBFGS
+	url = https://github.com/hjmshi/PyTorch-LBFGS.git
+[submodule "PyTorch-LBFGS"]
+	path = PyTorch-LBFGS
+	url = https://github.com/hjmshi/PyTorch-LBFGS.git
