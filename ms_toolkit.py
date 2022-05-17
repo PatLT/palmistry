@@ -6,9 +6,6 @@ Created on Tues Nov 09 2021
 @author: Pat Taylor (pt409)
 """
 #%% Libraries
-from dataclasses import replace
-from distutils.log import warn
-from typing_extensions import runtime
 import numpy as np
 import pandas as pd
 import dill
@@ -17,13 +14,13 @@ import ast
 import functools
 
 from sklearn.metrics import r2_score,mean_squared_error
-from scipy.stats import pearsonr
 
 import sklearn.gaussian_process as gp
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process.kernels import ConstantKernel
 from sklearn.decomposition import PCA
+from sklearn.linear_model import BayesianRidge,ARDRegression
 from sklearn.utils.optimize import _check_optimize_result
 from joblib import Parallel,delayed
 from scipy.spatial.distance import pdist, cdist, squareform
@@ -34,6 +31,12 @@ from ase import data
 from ase.build import bulk
 # PyTorch, GPyTorch
 import torch, gpytorch
+
+import sys
+# sys.path.append("gpytorch/examples")
+# from LBFGS import FullBatchLBFGS
+sys.path.append("PyTorch-LBFGS/functions")
+from LBFGS import LBFGS,FullBatchLBFGS
 
 import matplotlib.pyplot as plt
 
@@ -973,13 +976,17 @@ class HRrep_parent():
         return out[mask]
 
     @inputOutputRule
-    def _tr_prp_rep(self,X,at_nums,y=None):
+    def _tr_prp_rep(self,X,at_nums,y=None,**kwargs):
         """
         Pettifor replacement probability for a given species in an alloy.
         """
+        excl_self = kwargs.get("excl_self",True)
+
         mask = self._gen_mask(X)
         X = self._c_dims(X)
         M = self.mod_pettifor_M.iloc[at_nums,at_nums].values
+        if excl_self:
+            M -= np.eye(M.shape[0])
         out = np.einsum("kj,ij->ki",X,M).flatten()
         return out[mask]
 
@@ -1049,12 +1056,16 @@ class HRrep_parent():
         return np.einsum("kj,ki,ij->k",X,X,M)
 
     @inputRule
-    def _tr_prp_m(self,X,at_nums,y=None):
+    def _tr_prp_m(self,X,at_nums,y=None,**kwargs):
         """
         Mean pettifor replacement probability for all of the atomic species.
         """
+        excl_self = kwargs.get("excl_self",True)
+
         X = self._c_dims(X)
         M = self.mod_pettifor_M.iloc[at_nums,at_nums].values
+        if excl_self:
+            M -= np.eye(M.shape[0])
         return np.einsum("kj,ki,ij->k",X,X,M)
 
     @inputRule
@@ -1144,14 +1155,13 @@ class HRrep_parent():
         """
         Bin the at. % into (user-specified)  l-orbital electron bins. 
         """
-        bin_ledges = copy(kwargs.get("bin_ledges",[2.0]))
+        bins = copy(kwargs.get("bins",[2.0,10.0]))
         l = kwargs.get("l","s")
-        n_redges = len(bin_ledges)
-        bin_ledges += [np.inf]
+        n_redges = len(bins) - 1
         X = self._c_dims(X)
         m = self.elemental_props.iloc[at_nums].loc[:,"Number {} electrons".format(l)].values
         mat = np.zeros((n_redges,len(m)))
-        for i,(ledge,redge) in enumerate(zip(bin_ledges[:-1],bin_ledges[1:])):
+        for i,(ledge,redge) in enumerate(zip(bins[:-1],bins[1:])):
             mat[i] = (m >= ledge) * (m < redge)
         return X@mat.T
 
@@ -1916,6 +1926,7 @@ class ModelClass():
     X_transformer   :   Simple transformer (needs fit,transform methods).
     regressor       :   Any sklearn regression model class should work.
     committee_method:   Either "weighted" or "best". Only used when there is a y_splitter
+    flatten         :   Whether or not to always flatten final y before fitting.
     """
     def __init__(self,phys_transformer=None,
                     splitter = None,
@@ -1925,7 +1936,8 @@ class ModelClass():
                     X_transformer=None,
                     regressor=None,
                     n_jobs=-1,
-                    bagging_method = "weighted"):
+                    bagging_method = "weighted",
+                    flatten=False):
         self.phys_transformer=deepcopy(phys_transformer)
         self.y_transformer=deepcopy(y_transformer)
         # y_splitter stuff
@@ -1944,10 +1956,14 @@ class ModelClass():
             for a in range(self.num_splits):
                 self.regressor[a] = deepcopy(regressor)
         self.n_jobs = n_jobs
+        # Flatten
+        self.flatten = flatten
         # Flags
         self.fitted = False
 
     def _fit_by_split(self,X,y,a):
+        if self.flatten:
+            y = y.reshape(-1)
         if self.regressor[a] is not None:
             self.regressor[a].fit(X,y)
 
@@ -2155,14 +2171,18 @@ class GModelClass(ModelClass):
                     optimizer_lr = 0.1,
                     max_iter = 1e5,
                     conv_tol = 1.e-4,
+                    conv_tol_2 = 0.5,
                     optimizer_method = "adam",
                     n_restarts = 1,
                     restart_method = "random",
                     scheduler_dr = 0.999,
                     n_jobs=1,
                     bagging_method = "weighted",
+                    max_ls = 50,
                     use_cuda = True,
-                    seed=1958):
+                    trial_base_kernel_params = None,
+                    seed=1958,
+                    verbose=False):
         super(GModelClass,self).__init__(phys_transformer,splitter,y_transformer,y_scaler,
                                         X_scaler,X_transformer,None,n_jobs,bagging_method)
         
@@ -2183,8 +2203,12 @@ class GModelClass(ModelClass):
         self.optimizer_lr = optimizer_lr if hasattr(optimizer_lr,"__len__") else [optimizer_lr]
         self.scheduler_dr = scheduler_dr
         self.conv_tol = conv_tol
+        self.conv_tol_2 = conv_tol_2 # Only used by LBFGS
         self.n_restarts = n_restarts
         self.restart_method = restart_method
+        self.verbose = verbose # whether to print something when linesearch fails
+        self.max_ls = max_ls # max number of linesearch steps
+        self.trial_base_kernel_params = trial_base_kernel_params # Kernel params to try from a discrete list. 
         self.optimizer_method = optimizer_method.lower()
         self.states = {}
         self.training_data = {}
@@ -2224,67 +2248,106 @@ class GModelClass(ModelClass):
                     # Use the adam optimizer
                     optimizer = torch.optim.Adam(model.parameters(), lr=lr)  # Includes GaussianLikelihood parameters
                 elif self.optimizer_method == "lbfgs":
-                    # Use the L-BFGS-B optimiser. 
-                    optimizer = torch.optim.LBFGS(model.parameters(),lr=lr)
-                scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer,self.scheduler_dr)
+                    # Use the L-BFGS optimiser. 
+                    optimizer = FullBatchLBFGS(model.parameters(),lr=lr,line_search="Wolfe")
+                if self.scheduler_dr < 1.0:
+                    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer,self.scheduler_dr)
                 iter_ = 0 ; old_loss = 1.e8 ; rel_change = 1.e8
-                while iter_<self.max_iter and rel_change>self.conv_tol:
+                # Need this for lbfgs optimizer
+                def closure():
                     # Zero gradients from previous iteration
                     optimizer.zero_grad()
                     # Output from model
                     output = model(X)
                     # Calc loss and backprop gradients
-                    loss = -mll(output, y)
-                    loss.backward()
-                    if self.optimizer_method=="lbfgs":
-                        # Need this for lbfgs optimizer
-                        def closure():
-                            optimizer.zero_grad()
-                            output = model(X)
-                            loss = -mll(output,y)
-                            loss.backward()
-                            return loss
-                        optimizer.step(closure)
-                    else:
+                    loss = -mll(output,y)
+                    return loss
+                loss = closure()
+                loss.backward()
+                if self.optimizer_method == "adam":
+                    while iter_<self.max_iter and rel_change>self.conv_tol:
+                        loss = closure()
+                        loss.backward()
                         optimizer.step()
-                    scheduler.step()
-                    iter_ += 1
-                    # stopping criteria
-                    new_loss = loss.item()
-                    rel_change = abs((old_loss - new_loss)/new_loss)
-                    old_loss = 1.*new_loss
-                if iter_ == self.max_iter:
-                    warnings.warn("Max number of iteration ({:.2e}) reached.".format(self.max_iter),UserWarning)
+
+                        # stopping criteria
+                        new_loss = loss.item()
+                        rel_change = abs((old_loss - new_loss)/new_loss)
+                        old_loss = 1.*new_loss
+                        if self.scheduler_dr < 1.0:
+                            scheduler.step()
+                        iter_ += 1
+                    if iter_ == self.max_iter:
+                        warnings.warn("Max number of iteration ({:.2e}) reached.".format(self.max_iter),UserWarning)
+                elif self.optimizer_method == "lbfgs":
+                    with gpytorch.settings.cholesky_jitter(1.e-2) ,\
+                        gpytorch.settings.deterministic_probes(True), \
+                            gpytorch.settings.max_preconditioner_size(20):
+                        while iter_<self.max_iter and rel_change>self.conv_tol:
+                            # LBFGS - copied from gpytorch examples: 02 Scalabale exact GPs
+                            loss, _, lr_, ls_num, _, _, _, fail = optimizer.step({"closure":closure,
+                                                                            "current_loss":loss,
+                                                                            "max_ls":self.max_ls,
+                                                                            "damping":False,
+                                                                            "c1":self.conv_tol,
+                                                                            "c2":self.conv_tol_2})
+                            if fail:
+                                if self.verbose:
+                                    print("\tIter {} did not converge after {} steps in line search.\n\tFinal LR = {:.3e}\n\tTrying new search direction.".format(iter_,ls_num,lr_))
+                            else:
+                                if self.verbose:
+                                    print("\tIter {} converged with LR = {:.3e}".format(iter_,lr_))
+                            if self.scheduler_dr < 1.0:
+                                scheduler.step()
+                            iter_ += 1
+                        if iter_ == self.max_iter:
+                            pass
+                            #warnings.warn("Max number of iterations ({}) reached.".format(self.max_iter),UserWarning)
             # Run optimisation, restart as many times as n_restarts
             # Store these as we loop over lr, restarts
-            init_r_lengths = model.state_dict().get("covar_module.base_kernel.raw_lengthscale",None).clone()
-            loss_list = np.zeros((self.n_restarts,len(self.optimizer_lr)))
+            init_r_lengths = deepcopy(model.state_dict())
+            loss_dict = {}
             r_lengths_dict = {}
             for lr_trial,lr in enumerate(self.optimizer_lr):
-                model.initialize(
-                        **{"covar_module.base_kernel.raw_lengthscale":init_r_lengths.clone()})
+                if self.verbose:
+                    print("\tLearning rate {:.2e} starting".format(lr))
+                model.load_state_dict(init_r_lengths)
                 for repeat in range(self.n_restarts):
-                    optimise(lr)
-                    r_lengths = model.state_dict().get("covar_module.base_kernel.raw_lengthscale",None).clone()
-                    constraint = model.covar_module.base_kernel.raw_lengthscale_constraint
-                    t_lengths = constraint.transform(r_lengths)
-                    loss_list[repeat,lr_trial] = -mll(model(X), y) + (t_lengths < 4.e3).sum()
-                    r_lengths_dict[(repeat,lr_trial)] = r_lengths
+                    if self.verbose:
+                        print("\tStart # {} starting".format(repeat))
+                    if self.trial_base_kernel_params is not None:
+                        for param_trial,(param_name, values) in enumerate(self.trial_base_kernel_params.items()):
+                            for val_trial,val in enumerate(values):
+                                if hasattr(model.covar_module.base_kernel,param_name):
+                                    setattr(model.covar_module.base_kernel,param_name,val)
+                                    optimise(lr)
+                                    # Get best lengthscales
+                                    r_lengths = deepcopy(model.state_dict())
+                                    loss_dict[(repeat,lr_trial,param_trial,val_trial)] = -mll(model(X), y) #+ (t_lengths < 4.e3).sum()
+                                    r_lengths_dict[(repeat,lr_trial,param_trial,val_trial)] = r_lengths
+                    else:
+                        optimise(lr)
+                        # Get best lengthscales
+                        r_lengths = deepcopy(model.state_dict())
+                        loss_dict[(repeat,lr_trial)] = -mll(model(X), y) #+ (t_lengths < 4.e3).sum()
+                        r_lengths_dict[(repeat,lr_trial)] = r_lengths
                     # if r_lengths is None:
                     #     break
-                    # Transform the true lengthscales
-                    if self.restart_method == "random":
-                        new_r_lengths = r_lengths[:,self.rng.permutation(r_lengths.shape[1])]
-                    else:
-                        new_t_lengths = t_lengths**1.5
-                        new_r_lengths = constraint.inverse_transform(new_t_lengths)
-                    model.initialize(
-                        **{"covar_module.base_kernel.raw_lengthscale":new_r_lengths.clone()})
+                    # Transform the true lengthscales:
+                    # This is completely broken hahahaha
+                    # That's why it's now commented out. 
+                    # if self.n_restarts > 1:
+                    #     if self.restart_method == "random":
+                    #         new_r_lengths = r_lengths[:,self.rng.permutation(r_lengths.shape[1])]
+                    #     else:
+                    #         new_t_lengths = t_lengths**1.5
+                    #         new_r_lengths = constraint.inverse_transform(new_t_lengths)
+                    #     model.initialize(
+                    #         **{"covar_module.base_kernel.raw_lengthscale":new_r_lengths.clone()})
             # Use the best lengths for final model.
             if r_lengths is not None:
-                use_rep = tuple(np.argwhere(loss_list==loss_list.min())[0])
-                model.initialize(
-                    **{"covar_module.base_kernel.raw_lengthscale":r_lengths_dict[use_rep]})
+                use_rep = min(loss_dict,key=loss_dict.get)
+                model.load_state_dict(r_lengths_dict[use_rep])
             if self.use_cuda:
                 self.regressor[a] = (deepcopy(model.cpu()),deepcopy(likelihood.cpu()))
                 self.states[a] = (model.cpu().state_dict(),likelihood.cpu().state_dict())
@@ -2294,7 +2357,7 @@ class GModelClass(ModelClass):
             self.training_data[a] = [X.cpu(),y.cpu()]
             # Store fit history
             self.fit_history[a] = {"learning rates":self.optimizer_lr,
-                                    "losses":loss_list,
+                                    "losses":loss_dict,
                                     "kernel_lengthscales":r_lengths_dict}
 
     def _predict_by_split(self,X,a,complete_transform=True):
@@ -2659,7 +2722,7 @@ def sc_corr_2p(X,k_prd,k_scov,f_prd,f_unc,lambda_=1.,rtn_cov=False):
     else:
         return tuple(k_prd_new),tuple(k_unc_new),f_prd_new,f_unc_new
 
-def bayesian_corr_2p(X,k_prd,k_scov,f_prd,f_unc,rtn_cov=False,tol=0.05):
+def bayesian_corr_2p(X,k_prd,k_scov,f_prd,f_unc,rtn_cov=False,tol=0.05,ff=0.2):
     """
     NOW A MODIFICATION OF bayesian_corr(). Apply a Bayesian correction to the microstructure predictions for
     2-phase alloys. This incorporates the likelihood of the model
@@ -2675,25 +2738,35 @@ def bayesian_corr_2p(X,k_prd,k_scov,f_prd,f_unc,rtn_cov=False,tol=0.05):
     f_prd   (ndarray)       : Predicted phase fractions (phase 2)
     f_unc   (ndarray)       : Associated phase uncertainties.
     rtn_cov (bool)          : Whether or not to return covariance matrices as output. 
-    tol     (float)         : Tolerance for soft constraint on element-total as % of overall amount. 
+    tol     (float)         : Tolerance for soft constraint on element-total as % of overall amount.
+    ff      (float)         : Fudge factor to multiply the fullfilment uncertainty by. 
     """
     k_prd_new = [[],[]] ; k_unc_new = [[],[]]
     f_prd_new = [] ; f_unc_new = []
     cov_list = []
-    for x_full,k_c,k_p,f_p,f_c in zip(X.values,k_scov,k_prd,f_prd,f_unc):
+    for i,(x_full,k_c,k_p,f_p,f_c) in enumerate(zip(X.values,k_scov,k_prd,f_prd,f_unc)):
         f_p = np.atleast_1d(f_p) ; f_c = np.atleast_2d(f_c)**2
         m = 2 # number of phases present
         n = len(k_p)//m # number of elements present.
         x = x_full[x_full>0.] # input composition
-        x1 = x*k_p[:n]
-        x2 = x*k_p[n:]
+        x1 = x*k_p[:n] ; x1_v = x*np.diag(k_c)[:n]
+        x2 = x*k_p[n:] ; x2_v = x*np.diag(k_c)[n:]
+        f_v = np.diag(f_c)
         # initial covariance matrix, converted to transformed variable form
         cov = block_diag(Logy.transform_cov(k_p,k_c),
                         ArcTanh.transform_cov(f_p,f_c))
+        # Calculate tolerance for the soft constraint
+        uncs = np.sqrt(
+            (1-f_p)**2*x1_v+f_p**2*x2_v+(x2-x1)**2*f_v
+        ) * ff
+        if hasattr(tol,"__len__"):
+            tols = tol[i]
+        else:
+            tols = tol*np.ones(n)
         # Simply import relevant matrix / vector for solutions as lambda functions
         A_l,b_l = correction_hc_Ab_system[n]
-        A = A_l(*x,*x1,*x2,*f_p,tol)
-        b = b_l(*x,*x1,*x2,*f_p,tol)
+        A = A_l(*x,*x1,*x2,*uncs,*tols,*f_p)
+        b = b_l(*x,*x1,*x2,*uncs,*tols,*f_p)
         corr  = inv(block_diag(inv(cov),np.zeros((m,m))) + A)@b
         # The covariance is a bit different though
         cov_new_inv  = inv(cov) + A[:-m,:-m]
@@ -2841,7 +2914,7 @@ def bayesian_corr(X,k_prd,k_scov,f_prd,f_scov):
         f_unc_new.append(np.diag(cov_out)[-m:])
     return k_prd_new,k_unc_new,f_prd_new,f_unc_new
 
-def reshape_cov2sub(X_orig,cov,y=None):
+def reshape_cov2sub(X_orig,cov,y=None,params=None):
         """
         Reshape the covariance array for predictions into a list of sub-covariance
         matrices, each corresponding to the covariance of predictions for a single
@@ -2862,6 +2935,8 @@ def reshape_cov2sub(X_orig,cov,y=None):
         sub_cov = [] # sub-covariance matrix list
         if y is not None:
             sub_y = []
+        if params is not None:
+            ragged_params = []
         start_ind = 0
         for entry in locs:
             end_ind = start_ind + entry.sum()
@@ -2876,8 +2951,107 @@ def reshape_cov2sub(X_orig,cov,y=None):
                     sub_y += [np.concatenate(sub_ys)]
                 else:
                     sub_y += [y[start_ind:end_ind]]
+            if params is not None:
+                ragged_params += [params[entry]]
             start_ind = copy(end_ind)
-        if y is not None:
+        if y is not None and params is not None:
+            return sub_cov, sub_y, ragged_params
+        elif y is not None:
             return sub_cov,sub_y
         else:    
             return sub_cov
+
+#%% LINEAR MODELS
+class BayesianRidgeCov(BayesianRidge):
+    def __init__(self, *, n_iter=300, tol=0.001, alpha_1=0.000001, alpha_2=0.000001, lambda_1=0.000001, lambda_2=0.000001, alpha_init=None, lambda_init=None, compute_score=False, fit_intercept=True, normalize=False, copy_X=True, verbose=False):
+        super().__init__(n_iter, tol, alpha_1, alpha_2, lambda_1, lambda_2, alpha_init, lambda_init, compute_score, fit_intercept, normalize, copy_X, verbose)
+
+    def predict(self, X, return_std=False, return_cov=False):
+        """
+        Overides the base class method in order to allow return of the full 
+        covariance matrix as well as the standard deviation. 
+
+        Parameters
+        ----------
+        X : {array-like, sparse matrix} of shape (n_samples, n_features)
+            Samples.
+        return_std : bool, default=False
+            Whether to return the standard deviation of posterior prediction.
+        return_cov : bool, default=False
+            Whether to return the covariance matrix of the posterior distribution.
+        Returns
+        -------
+        y_mean : array-like of shape (n_samples,)
+            Mean of predictive distribution of query points.
+        y_std : array-like of shape (n_samples,)
+            Standard deviation of predictive distribution of query points.
+        y_cov : array-like of shape (n_samples,n_samples)
+            Covariance of predicitve distribution of query points. 
+        """
+        y_mean = self._decision_function(X)
+        if return_std is False and return_cov is False:
+            return y_mean
+        # else:
+        #     if self._normalize:
+        #         X = (X - self.X_offset_) / self.X_scale_
+        if return_std is True:
+            sigmas_squared_data = (np.dot(X, self.sigma_) * X).sum(axis=1)
+            y_std = np.sqrt(sigmas_squared_data + (1.0 / self.alpha_))
+        if return_cov is True:
+            y_cov = X @ self.sigma_ @ X.T + (1.0 / self.alpha_)
+        # Returns 
+        if return_std is True and return_cov is False:
+            return y_mean, y_std
+        elif return_std is False and return_cov is True:
+            return y_mean, y_cov
+        else:
+            return y_mean, y_std, y_cov
+
+class ARDRegressionCov(ARDRegression):
+    def __init__(self, *, n_iter=300, tol=0.001, alpha_1=0.000001, alpha_2=0.000001, lambda_1=0.000001, lambda_2=0.000001, compute_score=False, threshold_lambda=10000, fit_intercept=True, normalize=False, copy_X=True, verbose=False):
+        super().__init__(n_iter, tol, alpha_1, alpha_2, lambda_1, lambda_2, compute_score, threshold_lambda, fit_intercept, normalize, copy_X, verbose)
+
+    def predict(self, X, return_std=False, return_cov=False):
+            """
+            Overides the base class method in order to allow return of the full 
+            covariance matrix as well as the standard deviation. 
+
+            Parameters
+            ----------
+            X : {array-like, sparse matrix} of shape (n_samples, n_features)
+                Samples.
+            return_std : bool, default=False
+                Whether to return the standard deviation of posterior prediction.
+            return_cov : bool, default=False
+                Whether to return the covariance matrix of the posterior distribution.
+            Returns
+            -------
+            y_mean : array-like of shape (n_samples,)
+                Mean of predictive distribution of query points.
+            y_std : array-like of shape (n_samples,)
+                Standard deviation of predictive distribution of query points.
+            y_cov : array-like of shape (n_samples,n_samples)
+                Covariance of predicitve distribution of query points. 
+            """
+            y_mean = self._decision_function(X)
+            if return_std is False and return_cov is False:
+                return y_mean
+            else:
+                # if self._normalize:
+                #     X = (X - self.X_offset_) / self.X_scale_
+                X = X[:, self.lambda_ < self.threshold_lambda]
+            if return_std is True:
+                sigmas_squared_data = (np.dot(X, self.sigma_) * X).sum(axis=1)
+                y_std = np.sqrt(sigmas_squared_data + (1.0 / self.alpha_))
+            if return_cov is True:
+                y_cov = X @ self.sigma_ @ X.T + (1.0 / self.alpha_)
+            # Returns 
+            if return_std is True and return_cov is False:
+                return y_mean, y_std
+            elif return_std is False and return_cov is True:
+                return y_mean, y_cov
+            else:
+                return y_mean, y_std, y_cov    
+
+
+

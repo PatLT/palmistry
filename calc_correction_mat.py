@@ -12,7 +12,7 @@ import dill
 
 dill.settings['recurse'] = True
 
-n_max = 3 # max number of component systems to do calculation for. 
+n_max = 16 # max number of component systems to do calculation for. 
 
 def gen_Ab_sys(n,m=2):
     # n = number of elements
@@ -75,8 +75,10 @@ def gen_Ab_sys(n,m=2):
 def gen_Ab_sys_hc(n,m=2):
     # n = number of elements
     # m = number of phases
-    # Constraint tolerances
+    # Constraint uncertainties, tolerance
+    unc = sp.symbols(" ".join(["unc_{}".format(i) for i in range(n)]))
     tol = sp.symbols(" ".join(["tol_{}".format(i) for i in range(n)]))
+    std = sp.symbols(" ".join(["std_{}".format(i) for i in range(n)]))
 
     # Corrections to log partitioning coefficients
     dp = sp.symbols(" ".join(
@@ -107,14 +109,14 @@ def gen_Ab_sys_hc(n,m=2):
     # Terms in lagrangian derivative
     # wrt dp
     L1 = [-(
-        (c[j]-sum([x[phi*n+j]*f[phi] for phi in range(m)]))/(c[j]*tol[j])**2*f[psi]
+        (c[j]-sum([x[phi*n+j]*f[phi] for phi in range(m)]))/std[j]**2*f[psi]
             #(1-sum([x[psi*n+i] for i in range(n)]))/tol_b    <-- This line gets modified
         )*sp.diff(x[psi*n+j],dp[psi*n+j])
         - mu[psi]*c[j]*xi[psi*n+j]
     for psi,j in product(range(m),range(n))]
     # wrt dq
     L2 = -sum([
-        sum([(c[i]-sum(x[phi*n+i]*f[phi] for phi in range(m)))/(c[i]*tol[i])**2*x[psi*n+i] for i in range(n)])\
+        sum([(c[i]-sum(x[phi*n+i]*f[phi] for phi in range(m)))/std[i]**2*x[psi*n+i] for i in range(n)])\
             * sp.diff(f[psi],dq)
     for psi in range(m)])
     # wrt mu
@@ -135,12 +137,16 @@ def gen_Ab_sys_hc(n,m=2):
 
     # Convert to matrix form
     A,b = sp.linear_eq_to_matrix(L1_l+[L2_l]+L3_l,list(dp)+[dq]+list(mu))
-    return sp.lambdify((*c,*xi,*tol,fi),A), sp.lambdify((*c,*xi,*tol,fi),b)
+    std_sub = [(std[i],c[i]*tol[i]+unc[i]) for i in range(n)]
+    A = A.subs(std_sub)
+    b = b.subs(std_sub)
+    return sp.lambdify((*c,*xi,*unc,*tol,fi),A), sp.lambdify((*c,*xi,*unc,*tol,fi),b)
 
 # %% BLOCK 2
 d_lambda_out = {}
 for n in range(2,n_max+1):
     d_lambda_out[n] = gen_Ab_sys_hc(n)
+    print("n = {} done".format(n))
 
 with open("correction_Ab_system.dill","wb") as outfile:
     dill.dump(d_lambda_out,outfile)
