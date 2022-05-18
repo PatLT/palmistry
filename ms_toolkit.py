@@ -6,6 +6,7 @@ Created on Tues Nov 09 2021
 @author: Pat Taylor (pt409)
 """
 #%% Libraries
+from typing import OrderedDict
 import numpy as np
 import pandas as pd
 import dill
@@ -1457,17 +1458,21 @@ class HRrep_parent():
         """
         use_aux_dims = kwargs.get("use_aux_dims","all")
         in_celsius = kwargs.get("in_celsius",True)
+        transform = kwargs.get("transform",False)
         num_ht = (self.aux_dims-int(self.multi_output))//2 if use_aux_dims=="all" else len(use_aux_dims)//2
         X = self._a_dims(X,use_aux_dims)
         T = X[:,::2]
         if in_celsius:
             T += 273.
         t = X[:,1::2]
-        rep0 = (T*t).sum(axis=1,keepdims=True)
-        out = np.c_[T,rep0]
-        for i in range(1,num_ht):
-            repi = rep0 + ((T[:,i-1]-T[:,i])*t[:,i]).reshape(-1,1)
-            out = np.c_[out,repi]
+        if transform: # Apply a transformation that has the correct exchange properties 
+            rep0 = (T*t).sum(axis=1,keepdims=True)
+            out = np.c_[T,rep0]
+            for i in range(1,num_ht):
+                repi = rep0 + ((T[:,i-1]-T[:,i])*t[:,i]).reshape(-1,1)
+                out = np.c_[out,repi]
+        else:
+            out = np.c_[T,t]
         return out
 
     @inputRule
@@ -2283,6 +2288,7 @@ class GModelClass(ModelClass):
                     with gpytorch.settings.cholesky_jitter(1.e-2) ,\
                         gpytorch.settings.deterministic_probes(True), \
                             gpytorch.settings.max_preconditioner_size(20):
+                        all_failed = True
                         while iter_<self.max_iter and rel_change>self.conv_tol:
                             # LBFGS - copied from gpytorch examples: 02 Scalabale exact GPs
                             loss, _, lr_, ls_num, _, _, _, fail = optimizer.step({"closure":closure,
@@ -2291,6 +2297,7 @@ class GModelClass(ModelClass):
                                                                             "damping":False,
                                                                             "c1":self.conv_tol,
                                                                             "c2":self.conv_tol_2})
+                            all_failed &= fail
                             if fail:
                                 if self.verbose:
                                     print("\tIter {} did not converge after {} steps in line search.\n\tFinal LR = {:.3e}\n\tTrying new search direction.".format(iter_,ls_num,lr_))
@@ -2301,8 +2308,8 @@ class GModelClass(ModelClass):
                                 scheduler.step()
                             iter_ += 1
                         if iter_ == self.max_iter:
-                            pass
-                            #warnings.warn("Max number of iterations ({}) reached.".format(self.max_iter),UserWarning)
+                            if all_failed:
+                                warnings.warn("Max number of iterations ({}) reached without any {} step linesearch converging".format(self.max_iter,self.max_ls),UserWarning)
             # Run optimisation, restart as many times as n_restarts
             # Store these as we loop over lr, restarts
             init_r_lengths = deepcopy(model.state_dict())
@@ -2322,14 +2329,14 @@ class GModelClass(ModelClass):
                                     setattr(model.covar_module.base_kernel,param_name,val)
                                     optimise(lr)
                                     # Get best lengthscales
-                                    r_lengths = deepcopy(model.state_dict())
+                                    r_lengths = OrderedDict({key:t.clone() for key,t in model.state_dict().items()})
                                     loss_dict[(repeat,lr_trial,param_trial,val_trial)] = -mll(model(X), y) #+ (t_lengths < 4.e3).sum()
                                     r_lengths_dict[(repeat,lr_trial,param_trial,val_trial)] = r_lengths
                     else:
                         optimise(lr)
                         # Get best lengthscales
-                        r_lengths = deepcopy(model.state_dict())
-                        loss_dict[(repeat,lr_trial)] = -mll(model(X), y) #+ (t_lengths < 4.e3).sum()
+                        r_lengths = OrderedDict({key:t.clone() for key,t in model.state_dict().items()})
+                        loss_dict[(repeat,lr_trial)] = -mll(model(X), y).clone().item() #+ (t_lengths < 4.e3).sum()
                         r_lengths_dict[(repeat,lr_trial)] = r_lengths
                     # if r_lengths is None:
                     #     break
@@ -2401,6 +2408,7 @@ class GModelClass(ModelClass):
         """
         Return a pickle-able version of the model instance.
         """
+
         inter_copy = deepcopy(self)
         if self.fitted:
             del inter_copy.regressor
